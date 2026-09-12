@@ -1,56 +1,47 @@
+# Security Suite
 
-ersion: 2026-09-12
+> **About this repository.** This is the original SOC YARA scanner repo. The
+> single-file `YARA_scanning.py` it started as is still here, alongside the
+> original `install.sh`, `docker-compose.yml` and manual installer. Everything
+> else is the suite that grew out of it, mirrored from
+> [`security-suite-dashboard`](https://github.com/gocar112/security-suite-dashboard).
+> `YARA_scanning.py` is kept for history; `run.py` is what you run.
 
-This book explains how to run the Security Suite, read the dashboard, triage
-findings, pivot indicators, update the local vulnerability database, and use
-remediation without turning a false positive into data loss.
 
-The suite is a local defensive SOC console. It watches files, scans them with
-YARA, extracts indicators, enriches CVE signals, and gives the operator guarded
-actions such as quarantine, restore, delete, purge, and clear lines.
+<p align="center">
+  <img src="assets/securitysuite.png" alt="Security Suite logo" width="112">
+</p>
 
-## Table of contents
+<p align="center">
+  <strong>A local SOC signal room for YARA detections, IOC pivots, CVE context, triage, and guarded remediation.</strong>
+</p>
 
-1. What this tool is
-2. Quick start
-3. Dashboard map
-4. Running scans
-5. Reading a finding
-6. Indicator pivots
-7. Triage workflow
-8. Remediation workflow
-9. Clear lines and log backups
-10. Database and NVD updates
-11. Release and GitHub workflow
-12. Troubleshooting
-13. Operator checklist
+![Security Suite dashboard overview](docs/images/dashboard.png)
 
-## 1. What this tool is
+Security Suite watches local folders, scans files against **1,004 YARA rules**,
+correlates detections with authentication telemetry, extracts indicators,
+enriches CVE findings with NVD/CISA context, and streams everything into a live
+browser dashboard.
 
-Security Suite is built for local defensive testing and small SOC-style
-operations. It is not an antivirus replacement. It is a signal room: the tool
-shows what matched, why it matched, what indicators were found, and what action
-an operator can safely take.
+## Quick Links
 
-Core jobs:
+- Operator guide: [book/Security-Suite-Operator-Guide.md](book/Security-Suite-Operator-Guide.md)
+- Detection engineering field guide: [book/Detection-Engineering-in-Practice.pdf](book/Detection-Engineering-in-Practice.pdf)
+- Database summary: [docs/database-summary.md](docs/database-summary.md)
+- Main dashboard screenshot: [docs/images/dashboard.png](docs/images/dashboard.png)
 
-- Watch configured folders for new or changed files.
-- Scan files with the local YARA ruleset.
-- Record findings in `data/findings.ndjson`.
-- Track triage state in `data/triage.json`.
-- Extract URLs, domains, IP addresses, hashes, registry paths, file paths,
-  wallets, and CVEs.
-- Enrich CVE findings with local NVD/CISA context when available.
-- Remediate only verified detection targets.
-- Back up active dashboard lines before clearing the live view.
+## At A Glance
 
-Important rule: remediation must act on a stored finding, not on a random path
-typed by a browser client. That is what keeps the delete and quarantine buttons
-from becoming arbitrary file tools.
+| Capability | What it does |
+| --- | --- |
+| Detect | Scans files with 1,004 YARA rules across malware, web shell, ransomware, credential theft, C2, supply-chain, Linux, Windows, and vulnerable-component namespaces. |
+| Correlate | Pulls nearby failed-logon telemetry from Windows Security log, macOS unified log, Linux auth logs, or journald. |
+| Pivot | Extracts URLs, domains, IPs, wallets, CVEs, hashes, registry keys, and file paths; dashboard values are defanged. |
+| Enrich | Uses NVD, OSV, CISA KEV, and optional VirusTotal hash lookups for context. |
+| Triage | Acknowledge, resolve, mark false positive, reopen, and clear dashboard lines with backup. |
+| Remediate | Quarantine, restore, delete, and purge detection targets behind hash checks, path confinement, and an audit trail. |
 
-## 2. Quick start
-
-From the project root:
+## Quick Start
 
 ```powershell
 python run.py
@@ -62,335 +53,305 @@ Then open:
 http://127.0.0.1:8787
 ```
 
-The browser usually opens automatically. The console should report the loaded
-rule count, the watched paths, and whether monitor mode is running.
+The server is built on Python's standard `http.server`, and the dashboard is
+plain HTML/CSS/JS. There is no frontend build step.
 
-Recommended first check:
-
-```powershell
-python -m compileall securitysuite tools
-node --check web\app.js
-```
-
-If this is a fresh machine, install dependencies first:
+Fresh machine setup:
 
 ```powershell
 pip install -r requirements.txt
+python run.py
 ```
 
-The required dependency is `yara-python`. `certifi` helps with TLS for online
-NVD calls. `pywin32` is optional and only helps Windows event-log collection.
-
-## 3. Dashboard map
-
-The dashboard is arranged for fast operator work.
-
-Top bar:
-
-- Stream status shows whether the browser is connected.
-- Monitor status shows whether the file watcher is active.
-- Rules pill shows the loaded YARA rule count.
-- Pause stops monitoring without closing the server.
-- Reload rules recompiles the rule set.
-
-Mission area:
-
-- Posture index summarizes current risk.
-- Source cards show whether enrichment sources are linked, ready, or online.
-- Operator controls let you tune sensitivity, focus mode, and event tone.
-
-KPI row:
-
-- Files scanned is the session total.
-- Detections counts YARA hits.
-- Open alerts counts findings still needing triage.
-- Critical / high shows priority detections.
-- Auth failures shows authentication correlation.
-- Uptime shows how long the watcher has been running.
-
-Main work area:
-
-- Findings is the live detection stream.
-- Extracted indicators is the pivot table.
-- Detection activity shows recent activity.
-- Live feed shows compact event lines.
-- Containment handles bulk remediation previews and actions.
-
-Right sidebar:
-
-- On-demand scan accepts a local path.
-- Namespaces and severity panels summarize the current dataset.
-- Recent sources summarize scan origins.
-
-## 4. Running scans
-
-There are two normal ways to scan.
-
-Monitor mode:
-
-1. Start the suite.
-2. Put a file inside a watched folder such as `uploads`.
-3. Wait for the finding to appear.
-
-On-demand mode:
-
-1. Paste a local file path into the on-demand scan box.
-2. Click Scan.
-3. Open the finding from the table if a rule matches.
-
-For testing PowerShell detections, use a disposable file under the project
-`uploads` folder. Do not test delete on valuable files. A detection test should
-be easy to recreate.
-
-## 5. Reading a finding
-
-Click a finding row to open the detail drawer.
-
-Look at these fields first:
-
-- Verdict: severity, trigger, and time.
-- Path: the target file that was scanned.
-- SHA-256: the hash recorded at detection time.
-- Status: new, acknowledged, resolved, false positive, or reopened.
-- Target state: whether the file is present, missing, quarantined, deleted, or
-  purged.
-- Rule matches: rule names, namespaces, tags, descriptions, and matched strings.
-- Guidance: playbook notes, patch references, and CVE/KEV action when available.
-- Extracted indicators: safe, defanged values that can be copied into tickets.
-
-The hash is important. Delete and quarantine re-check the file hash immediately
-before acting. If the file changed after detection, remediation refuses the
-action instead of touching the wrong content.
-
-## 6. Indicator pivots
-
-The indicator table is for fast investigation.
-
-Use it to answer:
-
-- What URLs or domains appeared in detected files?
-- Which IPs or onion addresses were embedded?
-- Which CVEs were referenced?
-- Which hashes are repeated across multiple detections?
-- Which file paths or registry keys were present?
-
-Values in the dashboard are defanged so they are safer to paste into a ticket.
-Use Export CSV when you need the raw values for a controlled workflow.
-
-For CVE indicators, the tool adds NVD pivot links when the local database has
-context. Use those links to confirm vendor guidance before patching production
-systems.
-
-## 7. Triage workflow
-
-Use this order:
-
-1. Acknowledge the finding when you have started looking at it.
-2. Read the matched rule names and strings.
-3. Check whether the target file is still present.
-4. Review indicators and CVE guidance.
-5. Decide whether the finding is malicious, benign, or uncertain.
-6. Use Resolve only after you have contained or documented the issue.
-7. Use False positive only when the rule match is understood and safe.
-8. Use Reopen if new evidence changes the decision.
-
-Status changes are triage notes. They do not delete files by themselves.
-
-## 8. Remediation workflow
-
-Remediation actions are intentionally guarded.
-
-Available actions:
-
-- Quarantine moves the detected file into the quarantine area and records sidecar
-  metadata so it can be restored later.
-- Restore moves a quarantined file back to its original location when safe.
-- Delete permanently removes the detected file.
-- Purge permanently removes a quarantined copy.
-
-Safety rails:
-
-- The target path comes from the stored finding.
-- The current SHA-256 must match the finding hash.
-- The resolved path must be inside permitted roots.
-- Suite-owned paths are refused.
-- Directories are refused unless explicitly allowed by server-side logic.
-- Missing confirmation is refused.
-- Repeated actions on an already-handled target are refused.
-- Every attempt is written to the audit trail.
-
-Recommended action order:
-
-1. Prefer Quarantine when you may need evidence later.
-2. Use Delete only when the finding is confirmed and the file is disposable.
-3. Use Restore only when the quarantined object is known safe or needed for
-   controlled analysis.
-4. Use Purge when the quarantined copy no longer needs to be preserved.
-
-Why delete used to fail:
-
-The tool must refuse delete if the target is already gone, if the finding is not
-a YARA detection, if the hash changed, if the file is outside allowed roots, or
-if the file is part of the suite itself. Those refusals are correct. A working
-delete button should remove eligible detected files and explain every refusal.
-
-## 9. Clear lines and log backups
-
-Clear lines is a dashboard maintenance action. It clears the active finding
-stream and triage lines so the room is clean for the next run.
-
-What Clear lines does:
-
-- Backs up active logs under `data/log-backups/`.
-- Clears the live findings file.
-- Clears live triage state.
-- Refreshes the dashboard counters.
-
-What Clear lines does not do:
-
-- It does not delete watched files.
-- It does not delete quarantined files.
-- It does not delete the YARA rules.
-- It does not revoke or rotate secrets.
-- It does not clean Git history.
-
-Use Clear lines after a test run, after a demo, or before a focused scan window.
-Do not use it as incident response evidence handling. If evidence matters, copy
-the backup folder into your case record first.
-
-## 10. Database and NVD updates
-
-The local database summary is generated into:
-
-```text
-docs/database-summary.md
-```
-
-To summarize the current local database:
-
-```powershell
-python tools\summarize_database.py
-```
-
-When the server is running, the dashboard can sync source cards and the API can
-refresh NVD data. If the NVD sync reports `truncated: true`, the time window has
-more records than the current request limit. Run smaller windows when you need a
-complete import.
-
-Operational pattern:
-
-1. Sync NVD for the time window you care about.
-2. Generate `docs/database-summary.md`.
-3. Commit the code and summary together.
-4. Let GitHub Actions run the Python YAML workflow.
-
-## 11. Release and GitHub workflow
-
-Before a release:
+Recommended verification before release:
 
 ```powershell
 python -m compileall securitysuite tools
 node --check web\app.js
 python tools\summarize_database.py
-git status --short
 ```
 
-Use GitHub Actions to check Windows Python versions. The repository includes a
-workflow at:
+## Requirements
+
+| Package | Status | Needed for |
+| --- | --- | --- |
+| `yara-python` | Required | YARA compile and scan engine |
+| `certifi` | Recommended | Current CA bundle for NVD TLS requests |
+| `pywin32` | Optional, Windows only | Windows Security event-log telemetry |
+
+Python 3.10 or newer is recommended.
+
+## How To Use It
+
+### 1. Start The Console
+
+```powershell
+python run.py
+```
+
+The console prints the loaded rule count, watched folders, telemetry source, and
+whether auto-remediation is armed.
+
+### 2. Drop A Test File
+
+```powershell
+copy samples\README_RESTORE.txt uploads\
+```
+
+On macOS or Linux:
+
+```bash
+cp samples/README_RESTORE.txt uploads/
+```
+
+The finding should appear in the dashboard within a few seconds.
+
+![Findings table](docs/images/findings.png)
+
+### 3. Open The Finding
+
+Click the row to inspect the detection.
+
+The drawer shows:
+
+- Verdict, severity, and trigger.
+- File path, SHA-256, size, entropy, and target state.
+- Every matched rule and matched string offset.
+- CVE, KEV, and patch guidance when available.
+- Extracted indicators.
+- Triage and remediation actions.
+
+![Finding detail drawer](docs/images/finding-drawer.png)
+
+### 4. Pivot Indicators
+
+The indicator panel aggregates observables across all detected files.
+
+![Extracted indicators](docs/images/indicators.png)
+
+Use **Export CSV** when you want to hand the observable set to a SIEM or ticket.
+
+### 5. Remediate Carefully
+
+![Remediation panel](docs/images/remediation-panel.png)
+
+Use **Quarantine** first when evidence might matter. Use **Delete** only when
+the file is confirmed malicious or disposable.
+
+## Remediation Safety
+
+Remediation is the destructive part of the suite. Everything else is read-first.
+
+| Action | Meaning | Reversible? |
+| --- | --- | --- |
+| `quarantine` | Move the detected file into quarantine with metadata. | Yes |
+| `restore` | Move a quarantined file back to its original path. | Usually |
+| `delete` | Permanently remove the detected file. | No |
+| `purge` | Permanently remove a quarantined copy. | No |
+
+A remediation action proceeds only when the safety rails pass:
+
+1. Target path comes from the stored finding, not from the browser request.
+2. SHA-256 is re-checked immediately before action.
+3. Resolved path must stay inside permitted roots.
+4. Suite-owned paths are refused.
+5. Directories are refused unless explicitly allowed.
+6. Confirmation is required.
+7. Already-handled targets are refused.
+8. Attempts and refusals are written to the audit trail.
+
+Auto-remediation is off by default. If enabled, the default action should remain
+`quarantine`, not delete.
+
+### Why rail 4 exists
+
+Pointed at this repository, the current ruleset flags **27 of 55 tracked files,
+16 of them critical** — including `rules/c2_network.yar` and
+`rules/credential_theft.yar`. A rule that hunts for `sekurlsa::logonpasswords`
+necessarily contains that string. Without the suite-owned-path rail, an
+auto-delete-at-critical run would delete the detector's own ruleset.
+
+An earlier version of that rail listed protected directories instead of
+protecting the tree, and a test deleted this README. Enumerating what to protect
+produces a list that is never complete.
+
+> **Expect false positives.** 1,004 rules, 931 of them generated and never run
+> against your data. One rule in this repo raised *critical* on a reading list
+> containing the word *Exodus*. Prefer `quarantine` until a rule has earned your
+> trust; `delete` cannot be undone.
+
+## Clear Lines
+
+**Clear lines** resets the active dashboard stream after backing it up.
+
+It clears:
+
+- `data/findings.ndjson`
+- `data/triage.json`
+- the live dashboard table/feed state
+
+It does not clear:
+
+- watched files
+- quarantined files
+- YARA rules
+- Git history
+- secrets or environment variables
+
+Backups are written under:
 
 ```text
-.github/workflows/python.yml
+data/log-backups/
 ```
 
-Security rule: never paste GitHub tokens, API keys, passwords, or private keys
-into chat, commits, README files, or issue text. If a token was pasted anywhere
-public or semi-public, revoke it and create a new one with minimum permissions.
+## Samples
 
-Release checklist:
+Each sample is harmless text and is designed to trip one rule.
 
-- README screenshot is current.
-- `docs/database-summary.md` is current.
-- Delete and quarantine have been tested with disposable files.
-- Clear lines has been tested and created a backup.
-- Compile and JavaScript checks pass.
-- No secrets appear in tracked files.
+| Sample | Rule | Severity |
+| --- | --- | --- |
+| `README_RESTORE.txt` | `Ransom_Note_Template` | critical |
+| `cleanup_commands.txt` | `Defense_Evasion_Commands` | critical |
+| `dump_notes.txt` | `Credential_Dumper_Indicators` | critical |
+| `task_setup.log` | `PowerShell_Encoded_Command` | high |
+| `update_helper.txt` | `PowerShell_Download_Cradle` | high |
+| `mail_body.txt` | `Suspicious_Double_Extension` | medium |
+| `report_q3.txt` | clean scan | none |
 
-## 12. Troubleshooting
+## Intelligence And Database
 
-Delete button does nothing:
+The source lattice separates live adapters from reference links.
 
-- Confirm the finding is a YARA detection.
-- Confirm the target file still exists.
-- Confirm the target hash has not changed.
-- Confirm the file is inside a watched or permitted remediation root.
-- Open the drawer and read the returned refusal reason.
+| Source | Credential | Purpose |
+| --- | --- | --- |
+| NVD | Optional | CVE lookup, keyword search, modification-window sync |
+| OSV | None | Commit, package, version, and purl vulnerability lookup |
+| VirusTotal | Required | Hash reputation; no file upload |
+| CISA KEV | None | Known exploited vulnerability context |
+| GitHub Advisories | None | Reference link |
+| Vuls | None | Reference link |
+| ClawFire | None | Reference link |
 
-Quarantine does nothing:
+Summarize the local database:
 
-- Confirm the quarantine directory exists.
-- Confirm the file has not already been quarantined, deleted, or purged.
-- Confirm the target is not part of the suite itself.
-- Check the remediation audit trail.
+```powershell
+python tools\summarize_database.py
+```
 
-Clear lines does not clear the table:
+Sync a trailing NVD window while the server is running:
 
-- Confirm the server is running.
-- Confirm the browser is connected to `127.0.0.1:8787`.
-- Refresh the page after the clear action.
-- Check for a new folder under `data/log-backups/`.
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/api/nvd/sync -ContentType "application/json" -Body '{"days":3}'
+```
 
-Rules do not reload:
+## CLI
 
-- Run `python -m compileall securitysuite tools`.
-- Check for YARA syntax errors in recently edited rule files.
-- Restart the server if the browser status does not recover.
+```powershell
+python run.py
+python run.py --watch D:\ftp --watch E:\inbox
+python run.py --port 9000 --no-browser
+python run.py --scan .\uploads
+python run.py --headless
+python run.py --scan-existing
+```
 
-NVD sync fails:
+## Configuration
 
-- Confirm the machine has network access.
-- Install or update `certifi`.
-- Retry with a smaller date range.
-- Keep the existing local cache if you are offline.
+Defaults live in [securitysuite/config.py](securitysuite/config.py). To override
+them, create `config.json` in the project root.
 
-Dashboard looks stale:
+```json
+{
+  "watch_paths": ["uploads"],
+  "recursive": true,
+  "poll_interval": 2.0,
+  "settle_seconds": 1.0,
+  "max_file_mb": 64,
+  "lookback_minutes": 5,
+  "host": "127.0.0.1",
+  "port": 8787,
+  "auto_remediate": false,
+  "auto_remediate_action": "quarantine"
+}
+```
 
-- Click Reload rules only for rule changes.
-- Click Sync source cards for enrichment status.
-- Use Clear lines only when you want to wipe active lines.
-- Restart the server after backend code changes.
+## API Snapshot
 
-## 13. Operator checklist
+All endpoints are intended for localhost use. The server rejects non-loopback
+`Host` headers.
 
-Start of session:
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/api/state` | Current stats, monitor status, engine info, telemetry, config |
+| GET | `/api/findings` | Filtered findings |
+| POST | `/api/findings/clear` | Back up and clear active dashboard lines |
+| GET | `/api/rules` | Loaded rules and compile errors |
+| POST | `/api/rules/reload` | Recompile the YARA ruleset |
+| POST | `/api/scan` | Scan a file or directory |
+| POST | `/api/monitor` | Pause or resume monitoring |
+| POST | `/api/triage` | Acknowledge, resolve, false-positive, or reopen a finding |
+| GET | `/api/iocs` | Extracted indicators, JSON or CSV |
+| GET | `/api/remediate` | Remediation status and recent actions |
+| GET | `/api/remediate/guidance` | Guidance for a finding |
+| POST | `/api/remediate` | Quarantine, restore, delete, or purge one finding |
+| POST | `/api/remediate/bulk` | Preview or execute bulk remediation |
+| GET | `/api/nvd` | NVD cache status |
+| POST | `/api/nvd/sync` | Sync a trailing NVD modification window |
+| GET / POST | `/api/osv/query` | OSV lookup |
+| GET | `/api/vt/file` | VirusTotal hash reputation |
+| GET | `/api/stream` | Server-Sent Events stream |
 
-- Start with `python run.py`.
-- Confirm monitor status is live.
-- Confirm rule count is expected.
-- Confirm watched path is the folder you intend to test.
-- Keep test files disposable.
+## Project Layout
 
-During triage:
+```text
+run.py                         launcher
+config.json                    optional local overrides
+securitysuite/                 scanner, store, server, APIs
+rules/                         YARA rules
+rules/generated/               generated vulnerable-component rules
+samples/                       harmless test files
+uploads/                       default watched folder
+web/                           dashboard HTML/CSS/JS
+assets/                        app logo and desktop icon
+book/                          operator and field-guide documentation
+docs/images/                   README screenshots
+docs/database-summary.md       generated local database summary
+data/findings.ndjson           active finding log
+data/triage.json               active triage state
+data/remediation.json          remediation audit/state
+data/log-backups/              Clear lines backups
+quarantine/                    quarantined files and metadata
+nvds/                          local NVD cache
+```
 
-- Open the finding drawer.
-- Read rule names and matched strings.
-- Check target state.
-- Check hash and indicators.
-- Preserve suspicious files before delete when evidence matters.
+## Documentation
 
-Before remediation:
+Use the README for setup and release checks. Use the operator guide for daily
+workflow:
 
-- Prefer quarantine first.
-- Use delete only for confirmed disposable targets.
-- Read every refusal message.
-- Do not disable safety rails to make a button green.
+- [Security Suite Operator Guide](book/Security-Suite-Operator-Guide.md)
+- [Detection Engineering In Practice PDF](book/Detection-Engineering-in-Practice.pdf)
+- [Detection Engineering In Practice DOCX](book/Detection-Engineering-in-Practice.docx)
 
-After session:
+## Security Notes
 
-- Export indicators if needed.
-- Generate the database summary.
-- Use Clear lines to reset the dashboard.
-- Confirm the backup folder exists.
-- Run compile and JavaScript checks before committing.
+- Keep the server bound to `127.0.0.1` unless you add authentication.
+- Run as Administrator on Windows only if you need Security event-log telemetry.
+- Never paste API keys, GitHub tokens, passwords, or private keys into commits,
+  issues, README files, or chat.
+- This client never uploads files to VirusTotal. Hash reputation is lookup-only.
+- Remediation is manual by default. Leave auto-remediation off until rules are
+  tested against your own data.
 
-The goal is simple: move fast, keep evidence, and make every destructive action
-explain itself.
+## What Changed From `YARA_scanning.py`
+
+| Original | Security Suite |
+| --- | --- |
+| One directory, non-recursive scan loop | Recursive watcher with settle checks |
+| Rule compile failure could hide behind fallback behavior | Compile errors are surfaced by rule file |
+| Rule matches were just names | Full rule metadata, strings, offsets, severity, and namespace |
+| No file identity | SHA-256, size, mtime, entropy, and target state |
+| Own logs could be rescanned | Suite output and protected paths are excluded |
+| No pause or reload | Pause/resume monitor and hot-reload rules |
+| Print/log output | Live dashboard, triage workflow, IOC panel, JSON API |
+| Detection only | Guarded quarantine, restore, delete, purge, and clear lines |
