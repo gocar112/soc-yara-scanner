@@ -1,17 +1,16 @@
 name: Python security suite checks
 
-# Runs on Linux, not windows-latest like the mirror repo does.
+# Runs the suite on Windows and Linux, on three Python versions.
 #
-# This repository's name ends with a period. Windows cannot create a directory
-# whose name ends in ".", so actions/checkout fails before any step runs:
+# Windows coverage was impossible here until this repository was renamed. The
+# old name ended with a period, and Windows cannot create a directory whose
+# name ends in ".", so actions/checkout failed before any step ran:
 #
 #   Directory 'D:\a\-SOC-Detector-YARA-Scanner.\-SOC-Detector-YARA-Scanner.'
 #   does not exist
 #
-# CI here has therefore never been able to pass. Ubuntu has no such
-# restriction. The real fix is to rename the repository; until then this at
-# least runs the suite. The Windows-specific paths stay covered by the same
-# workflow in security-suite-dashboard.
+# Every step below uses bash, which is present on both runners, so one
+# definition covers both platforms rather than two that can drift apart.
 
 on:
   push:
@@ -23,13 +22,18 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   validate:
-    name: Validate on Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-latest, ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
