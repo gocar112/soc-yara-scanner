@@ -1,16 +1,53 @@
-version: "3.8"
+# Security Suite - local container run.
+#
+# The previous version of this file could not work. It declared `build: .` with
+# no Dockerfile in the repository, pointed YARA_RULES_FILE at
+# rules/test_rule.yar which does not exist, and set WATCH_DIRECTORY,
+# AUTH_LOG_PATH and FINDINGS_FILE - the interface of the original single-file
+# YARA_scanning.py, which the suite's config.py does not read at all. It also
+# bind-mounted ./findings.ndjson as a file, which Docker creates as a directory
+# when it is missing.
+#
+# The suite is configured by config.json and CLI flags, so that is what this
+# passes.
 services:
   scanner:
     build: .
-    image: soc-yara-scanner:latest
-    container_name: soc-yara-scanner
+    image: security-suite:latest
+    container_name: security-suite
     restart: unless-stopped
-    environment:
-      - WATCH_DIRECTORY=/app/uploads
-      - YARA_RULES_FILE=/app/rules/test_rule.yar
-      - AUTH_LOG_PATH=/var/log/auth.log
-      - FINDINGS_FILE=/app/findings.ndjson
+
+    # Published to the host's loopback only. The dashboard has no
+    # authentication - see "Security Notes" in the README - so it must not be
+    # reachable from the network. The container binds 0.0.0.0 internally
+    # because 127.0.0.1 inside a container is unreachable from the host.
+    ports:
+      - "127.0.0.1:8787:8787"
+
     volumes:
+      # Watched folder: drop files here to have them scanned.
       - ./uploads:/app/uploads:rw
-      - ./findings.ndjson:/app/findings.ndjson:rw
-      - /var/log/auth.log:/var/log/auth.log:ro
+      # Findings log, triage, cases, saved hunts, remediation audit trail.
+      - ./data:/app/data:rw
+      # Quarantined files and their metadata. Deliberately outside every watch
+      # path, or a quarantined file is re-detected forever.
+      - ./quarantine:/app/quarantine:rw
+      # NVD cache, so a restart does not re-sync from scratch.
+      - ./nvds:/app/nvds:rw
+      # Rules are read-only to the container: the suite reloads them on demand
+      # but never writes them, and a detector that can rewrite its own
+      # signatures is a detector you cannot trust.
+      - ./rules:/app/rules:ro
+
+    environment:
+      # Both optional. NVD works without a key at a lower rate limit;
+      # VirusTotal is hash-lookup only and never uploads a file.
+      - NVD_API_KEY=${NVD_API_KEY:-}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY:-}
+
+    # Remediation deletes and moves files. Nothing here needs added
+    # capabilities, and dropping them limits what a bug could reach.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

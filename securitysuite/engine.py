@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yara
 
+from . import attack
 from .ioc import extract as extract_iocs
 from .store import SEVERITY_RANK, now_iso
 
@@ -143,12 +144,14 @@ class YaraEngine:
         """Cheap metadata index so the UI can list what is actually loaded."""
         index = []
         for namespace, text in sources.items():
-            try:
-                compiled = yara.compile(source=text)
-            except yara.Error:
-                continue
+            # No compile here. reload() has already compiled every source in
+            # this dict in order to validate it, and the index is built purely
+            # by reading the text. Compiling a second time cost ~31% of every
+            # reload and the result was discarded unused.
+            #
             # yara-python has no rule introspection before a match, so parse the
             # declarations we care about out of the source text.
+            current: dict | None = None
             for line in text.splitlines():
                 stripped = line.strip()
                 if stripped.startswith("rule ") and "{" not in stripped[:5]:
@@ -156,8 +159,17 @@ class YaraEngine:
                     tags = []
                     if ":" in stripped:
                         tags = stripped.split(":", 1)[1].split("{")[0].split()
-                    index.append({"namespace": namespace, "rule": name, "tags": tags})
-            del compiled
+                    current = {
+                        "namespace": namespace, "rule": name, "tags": tags,
+                        # Namespace default covers the generated ruleset, which
+                        # is not tagged rule by rule.
+                        "mitre": list(attack.NAMESPACE_DEFAULTS.get(namespace, ())),
+                    }
+                    index.append(current)
+                elif current is not None and stripped.startswith(("mitre ", "mitre=")):
+                    ids = attack.parse_ids(stripped.split("=", 1)[-1])
+                    if ids:
+                        current["mitre"] = ids
         return index
 
     def info(self) -> dict:
@@ -189,7 +201,9 @@ class YaraEngine:
         with self._lock:
             rules = self.rules
         started = time.perf_counter()
-        raw_matches = rules.match(data=data) if rules else []
+        # Same timeout as scan_file: an adversarial buffer must not be
+        # able to park a scan thread indefinitely.
+        raw_matches = rules.match(data=data, timeout=60) if rules else []
         return self._result(label, data, raw_matches, started, len(data))
 
     def scan_file(self, path: str) -> dict:
@@ -206,11 +220,19 @@ class YaraEngine:
                 "severity": None,
             }
         started = time.perf_counter()
+        # One read for both the preview bytes and the digest. This used to read
+        # the head, then let YARA read the file, then call sha256_of() to read
+        # it a third time.
+        digest = hashlib.sha256()
+        head = b""
         with open(path, "rb") as handle:
-            head = handle.read(1 << 20)  # first MiB drives entropy + preview
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                if not head:
+                    head = block          # first MiB drives entropy + preview
+                digest.update(block)
         raw_matches = rules.match(filepath=str(path), timeout=60) if rules else []
         result = self._result(str(path), head, raw_matches, started, stat.st_size)
-        result["sha256"] = sha256_of(path)
+        result["sha256"] = digest.hexdigest()
         result["file_name"] = os.path.basename(path)
         result["modified"] = time.strftime(
             "%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)
@@ -240,6 +262,10 @@ class YaraEngine:
                     "meta": meta,
                     "severity": self.severity_of(meta, tags),
                     "description": meta.get("description", ""),
+                    # Resolved here so a finding carries its ATT&CK context from
+                    # the moment it is written, rather than needing a second
+                    # lookup against the ruleset that may since have reloaded.
+                    "attack": attack.resolve(meta, match.namespace),
                     "strings": strings[:12],
                 }
             )
