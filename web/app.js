@@ -1,106 +1,16 @@
-/* Security Suite dashboard - vanilla JS, fed by /api/* and an SSE stream. */
-"use strict";
-
-const $ = (id) => document.getElementById(id);
-const SEVS = ["critical", "high", "medium", "low", "info"];
-const SEV_COLOR = {
-  critical: "var(--critical)", high: "var(--high)", medium: "var(--medium)",
-  low: "var(--low)", info: "var(--info)",
-};
-
-let state = {
-  findings: [], selected: null, paused: false, lastStats: null, feedSeeded: false,
-  sensitivity: Number(localStorage.getItem("suite-sensitivity") || 72),
-  focusMode: localStorage.getItem("suite-focus") === "true",
-  toneEnabled: localStorage.getItem("suite-tone") === "true",
-  audioContext: null,
-};
-
-/* ------------------------------------------------------------------ utils */
-function esc(value) {
-  return String(value === undefined || value === null ? "" : value)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function clockOf(iso) {
-  if (!iso) return "--:--:--";
-  const d = new Date(iso);
-  return isNaN(d) ? String(iso).slice(11, 19) : d.toLocaleTimeString([], { hour12: false });
-}
-
-function bytes(n) {
-  if (n === undefined || n === null) return "-";
-  const units = ["B", "KB", "MB", "GB"];
-  let i = 0, v = Number(n);
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return (i === 0 ? v : v.toFixed(1)) + " " + units[i];
-}
-
-function duration(seconds) {
-  const s = Math.max(0, Math.floor(seconds || 0));
-  if (s < 60) return s + "s";
-  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
-  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
-}
-
-function shortPath(value) {
-  // Collapse the middle of a long path. Folder names containing spaces
-  // otherwise wrap at every space and shred the column.
-  const full = String(value || "");
-  if (full.length <= 48) return full;
-  const sep = full.indexOf("\\") >= 0 ? "\\" : "/";
-  const parts = full.split(/[\\/]/).filter(Boolean);
-  if (parts.length <= 3) return full;
-  return parts[0] + sep + "\u2026" + sep + parts.slice(-2).join(sep);
-}
-
-function baseName(p) {
-  return String(p || "").split(/[\\/]/).pop() || String(p || "");
-}
-
-function targetStateLabel(finding) {
-  if (!finding || finding.event_type !== "yara_match") return "";
-  const target = finding.target_state || (finding.target_exists === false ? "gone" : "");
-  if (!target || target === "present") return "";
-  if (target === "delete") return "deleted";
-  if (target === "quarantine") return "quarantined";
-  return target === "gone" ? "file gone" : target;
-}
-
-function targetStateBadge(finding) {
-  const label = targetStateLabel(finding);
-  if (!label) return "";
-  const target = String(finding.target_state || "gone").replace(/[^a-z_]/g, "");
-  return '<span class="target-badge target-' + esc(target) + '">' + esc(label) + '</span>';
-}
-
-function toast(message, isError) {
-  const el = document.createElement("div");
-  el.className = "toast" + (isError ? " err" : "");
-  el.textContent = message;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 3800);
-}
-
-async function api(path, options) {
-  const res = await fetch(path, options);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data.error || data.refused || res.status + " " + res.statusText);
-    err.status = res.status;
-    err.data = data;
-    throw err;
-  }
-  return data;
-}
-
-const post = (path, payload) =>
-  api(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload || {}),
-  });
+/* Security Suite console - vanilla JS modules, fed by /api/* and an SSE stream.
+ * No build step: these are native ES modules loaded straight by the browser.
+ */
+import {
+  $, SEVS, SEV_COLOR, state, esc, clockOf, bytes, duration, shortPath, baseName,
+  targetStateLabel, targetStateBadge, toast, api, post,
+} from "./js/core.js";
+import { attackChips, attackSection, loadAttack, renderAttack } from "./js/attack.js";
+import { mountRouter, showView, onView } from "./js/router.js";
+import { mountHunt, runHunt } from "./js/hunt.js";
+import { mountPalette } from "./js/palette.js";
+import { mountGraph, loadGraph } from "./js/graph.js";
+import { mountCases, refreshCases, createCase } from "./js/cases.js";
 
 /* -------------------------------------------------------------------- KPI */
 function renderStats(stats, monitor) {
@@ -172,6 +82,43 @@ function syncControls() {
   document.body.classList.toggle("focus-mode", state.focusMode);
 }
 
+function renderSourceFooter(sources) {
+  const footer = $("footer-sources");
+  if (!footer) return;
+  const sourceNames = {
+    nvd: "NVD",
+    osv: "OSV",
+    virustotal: "VirusTotal",
+    kev: "KEV",
+    github: "GitHub",
+    vuls: "Vuls",
+    clawfire: "ClawFire",
+  };
+  const live = [];
+  const ready = [];
+  const optional = [];
+  const linked = [];
+  (sources || []).forEach((source) => {
+    const name = sourceNames[source.id] || source.name || source.id;
+    if (!name) return;
+    if (source.status === "online") {
+      live.push(name);
+    } else if (source.status === "ready") {
+      ready.push(name);
+    } else if (source.status === "optional" || source.configured === false) {
+      optional.push(name);
+    } else {
+      linked.push(name);
+    }
+  });
+  const parts = [];
+  if (live.length) parts.push(live.join(" / ") + " live");
+  if (ready.length) parts.push(ready.join(" / ") + " ready");
+  if (optional.length) parts.push(optional.join(" / ") + " optional");
+  if (linked.length) parts.push(linked.join(" / ") + " catalog/reference");
+  footer.textContent = parts.join(" \u00b7 ") || "Local intelligence mode";
+}
+
 async function loadIntel() {
   try {
     const data = await api("/api/intel");
@@ -201,10 +148,12 @@ async function loadIntel() {
     }
     $("intel-status").textContent = data.status || "linked";
     $("intel-sync").textContent = "Synced " + clockOf(data.synced_at);
+    renderSourceFooter(sources);
   } catch (_) {
     // The source lattice still renders when the optional adapter endpoint is offline.
     $("intel-status").textContent = "local mode";
     $("intel-sync").textContent = "Local adapters ready";
+    renderSourceFooter([]);
   }
 }
 
@@ -336,6 +285,7 @@ function matchesFilters(finding) {
   return true;
 }
 
+
 /* ----------------------------------------------------------------- drawer */
 function openDrawer(id) {
   const finding = state.findings.find((f) => f.id === id);
@@ -384,6 +334,7 @@ function openDrawer(id) {
         '<code>' + esc(m.rule) + '</code>' +
         '<span class="faint mono">' + esc(m.namespace) + '</span>' +
         (m.tags || []).map((t) => '<span class="faint mono">#' + esc(t) + '</span>').join("") +
+        attackChips(m) +
       '</div>' +
       (m.description ? '<div class="dim" style="font-size:12.5px;margin-bottom:6px">' +
         esc(m.description) + '</div>' : '') +
@@ -391,6 +342,7 @@ function openDrawer(id) {
         '<div>' + esc(s.identifier) + ' @ 0x' + Number(s.offset).toString(16) +
         '  <span class="faint">' + esc(s.preview) + '</span></div>').join("") + '</div>' +
       '</div>').join("") : '') +
+    attackSection(finding) +
     remediationSection(finding) +
     '<h3>Guidance</h3><div id="guidance-box"></div>' +
     iocSection(finding) +
@@ -858,6 +810,7 @@ async function refresh() {
     renderSensor(data);
     loadIocs();
     loadRemediation();
+    loadAttack();
     $("sub-title").textContent = data.config.watch_paths.length + " path(s) monitored";
   } catch (err) {
     toast("Backend unreachable: " + err.message, true);
@@ -890,6 +843,20 @@ function connectStream() {
     $("rows").prepend(tr);
     $("empty").style.display = "none";
     $("findings-count").textContent = state.findings.length + " shown";
+  });
+  // The server closes the stream when this client fell so far behind that the
+  // store dropped it from the event bus. Without this the socket stayed open
+  // and kept delivering stats frames, so the dashboard read "live" while no
+  // longer receiving any findings. Resync from the API, then reconnect onto a
+  // fresh subscription.
+  source.addEventListener("overflow", () => {
+    $("stream-dot").className = "dot down";
+    $("stream-text").textContent = "resyncing";
+    toast("Event stream fell behind - resyncing", true);
+    source.close();
+    loadFindings();
+    refresh();
+    setTimeout(connectStream, 1000);
   });
   source.onerror = () => {
     $("stream-dot").className = "dot down";
@@ -1064,9 +1031,46 @@ function mountDrawer() {
     btn.addEventListener("click", () => remediate(btn.dataset.remediate)));
 }
 
+/* Views ask for things through events rather than importing each other, so
+ * the ATT&CK matrix can pivot into the findings table without the two modules
+ * depending on one another. */
+document.addEventListener("suite:filter", (e) => {
+  const { query, view } = e.detail || {};
+  if (query !== undefined) $("q").value = query;
+  if (view) showView(view);
+  loadFindings();
+});
+document.addEventListener("suite:hunt", (e) => runHunt((e.detail || {}).query));
+document.addEventListener("suite:open-finding", (e) => {
+  showView("findings");
+  openDrawer((e.detail || {}).id);
+});
+document.addEventListener("suite:case-from-campaign", (e) => {
+  const ids = (e.detail || {}).finding_ids || [];
+  showView("cases");
+  createCase(ids, {
+    title: "Campaign: " + ids.length + " linked findings",
+    severity: "critical",
+    summary: "Promoted from the correlation graph: these findings share a linking indicator.",
+  });
+});
+
+/* Graph and cases are only built when their view is first shown - the graph is
+ * an O(n^2) layout and there is no reason to pay for it on the overview. */
+const warmed = new Set();
+onView((id) => {
+  if (id === "graph" && !warmed.has("graph")) { warmed.add("graph"); mountGraph(); }
+  if (id === "graph") loadGraph();
+  if (id === "cases") refreshCases();
+});
+
 mountDrawer();
 wire();
 syncControls();
+mountRouter();
+mountHunt();
+mountPalette();
+mountCases();
 refresh();
 loadFindings();
 loadIntel();

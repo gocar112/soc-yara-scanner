@@ -1,5 +1,17 @@
 name: Python security suite checks
 
+# Runs the suite on Windows and Linux, on three Python versions.
+#
+# Windows coverage was impossible here until this repository was renamed. The
+# old name ended with a period, and Windows cannot create a directory whose
+# name ends in ".", so actions/checkout failed before any step ran:
+#
+#   Directory 'D:\a\-SOC-Detector-YARA-Scanner.\-SOC-Detector-YARA-Scanner.'
+#   does not exist
+#
+# Every step below uses bash, which is present on both runners, so one
+# definition covers both platforms rather than two that can drift apart.
+
 on:
   push:
     branches: [main, master]
@@ -10,13 +22,18 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   validate:
-    name: Validate on Python ${{ matrix.python-version }}
-    runs-on: windows-latest
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-latest, ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
@@ -30,19 +47,29 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Compile Python package
-        shell: pwsh
-        run: python -m compileall securitysuite tools
+        run: python -m compileall securitysuite tools tests
 
       - name: Validate dashboard JavaScript
-        shell: pwsh
-        run: node --check web/app.js
+        run: |
+          node --check web/app.js
+          for f in web/js/*.js; do node --check "$f"; done
+
+      - name: Run smoke tests
+        run: python tests/smoke.py
+
+      - name: Run API tests
+        run: python tests/test_api.py
+
+      - name: Run hunt query tests
+        run: python tests/test_hunt.py
+
+      - name: Run correlation and case tests
+        run: python tests/test_cases.py
 
       - name: Generate database summary
-        shell: pwsh
         run: python tools/summarize_database.py --output docs/database-summary.md

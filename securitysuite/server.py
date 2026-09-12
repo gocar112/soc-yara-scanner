@@ -9,16 +9,19 @@ import json
 import queue
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import attack, graph, hunt, report
 from .ioc import summarise, to_csv
 from .store import now_iso
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+ASSET_DIR = Path(__file__).resolve().parent.parent / "assets"
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
@@ -26,7 +29,27 @@ CONTENT_TYPES = {
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
 }
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
 MAX_BODY = 64 * 1024
+# Cache the VirusTotal key reachability probe; it is a blocking network call
+# on a request path the dashboard polls.
+VT_STATUS_TTL = 120.0
+_VT_STATUS_CACHE: dict = {}
+_VT_STATUS_LOCK = threading.Lock()
 
 INTEL_SOURCES = (
     ("vuls", "https://github.com/future-architect/vuls", "bridge"),
@@ -43,7 +66,7 @@ class Context:
     """Everything the request handler needs, injected onto the server object."""
 
     def __init__(self, cfg, engine, store, telemetry, monitor, nvd=None,
-                 osv=None, vt=None, remediator=None, guidance=None):
+                 osv=None, vt=None, remediator=None, guidance=None, cases=None):
         self.cfg = cfg
         self.engine = engine
         self.store = store
@@ -54,6 +77,7 @@ class Context:
         self.vt = vt
         self.remediator = remediator
         self.guidance = guidance
+        self.cases = cases
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -64,9 +88,15 @@ class Handler(BaseHTTPRequestHandler):
     def ctx(self) -> Context:
         return self.server.ctx  # type: ignore[attr-defined]
 
-    def log_message(self, fmt, *args):  # quieter console
-        if "/api/stream" not in str(args):
-            return
+    def log_message(self, fmt, *args):
+        """Silence per-request logging; the dashboard is the console.
+
+        The previous body returned early when the path was *not* /api/stream
+        and fell through to nothing when it was, so it logged nothing either
+        way and the condition was dead. Errors still surface: _guard() prints
+        tracebacks and log_error() is untouched.
+        """
+        return
 
     # ----------------------------------------------------------- primitives
     def _host_allowed(self) -> bool:
@@ -103,6 +133,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
+        for key, value in SECURITY_HEADERS.items():
+            self.send_header(key, value)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -113,18 +145,85 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(payload, default=str).encode("utf-8"),
                    "application/json; charset=utf-8")
 
-    def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > MAX_BODY:
-            return {}
+    def _read_body_bytes(self) -> bytes:
+        """Consume the request body off the socket, bounded by MAX_BODY.
+
+        An oversized body is drained and discarded rather than left in the
+        buffer, so the connection stays usable and the caller still sees an
+        empty body.
+        """
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return b""
+        if length <= 0:
+            return b""
+        try:
+            raw = self.rfile.read(min(length, MAX_BODY))
+            remaining = length - MAX_BODY
+            while remaining > 0:                  # drain the excess
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (OSError, ValueError):
+            return b""
+        return b"" if length > MAX_BODY else raw
+
+    @staticmethod
+    def _parse_body(raw: bytes) -> dict:
+        try:
+            payload = json.loads(raw or b"{}")
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
+        # A JSON body may legally be a list, string or number, but every caller
+        # here indexes it like a mapping.
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _int_param(raw, default: int, low: int, high: int) -> int:
+        """Parse a caller-supplied integer, clamped, never raising.
+
+        These were bare ``int(...)`` calls. ``?limit=abc`` raised ValueError out
+        of the handler, which killed the connection without sending any
+        response at all - the browser saw a network error, not a 400 - and left
+        an unbounded ``limit`` free to serialise the entire ring buffer.
+        """
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, value))
+
+    def _guard(self, handler) -> None:
+        """Run a route so no exception escapes as a silently dropped socket."""
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                  # client hung up; nothing to say
+        except Exception:
+            traceback.print_exc()
+            try:
+                self._json({"error": "internal error"}, 500)
+            except Exception:
+                pass                              # response already began
 
     def _static(self, name: str):
-        target = (WEB_DIR / name).resolve()
-        if not str(target).startswith(str(WEB_DIR.resolve())) or not target.is_file():
+        web_root = WEB_DIR.resolve()
+        target = (web_root / name).resolve()
+        # is_relative_to, not startswith: a sibling directory named "web-evil"
+        # satisfies a string prefix test against "web".
+        if not target.is_relative_to(web_root) or not target.is_file():
+            self._json({"error": "not found"}, 404)
+            return
+        ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
+        self._send(200, target.read_bytes(), ctype)
+
+    def _asset(self, name: str):
+        """Serve a file from assets/ (the app icon lives there, not in web/)."""
+        root = ASSET_DIR.resolve()
+        target = (root / name).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
             self._json({"error": "not found"}, 404)
             return
         ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
@@ -132,6 +231,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # --------------------------------------------------------------- routes
     def do_GET(self):
+        self._guard(self._handle_get)
+
+    def do_HEAD(self):
+        self._guard(self._handle_get)
+
+    def do_POST(self):
+        self._guard(self._handle_post)
+
+    def _handle_get(self):
         if not self._host_allowed():
             self._json({"error": "host not allowed"}, 403)
             return
@@ -141,13 +249,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/":
             self._static("index.html")
-        elif route in ("/app.js", "/styles.css", "/favicon.ico"):
+        elif route.endswith((".js", ".css", ".svg", ".map")) and ".." not in route:
+            # The whole web/ tree, so native ES modules resolve. _static()
+            # confines every path with is_relative_to before reading.
             self._static(route.lstrip("/"))
+        elif route == "/favicon.ico":
+            self._asset("securitysuite.ico")
         elif route == "/api/state":
             self._json(self._state())
         elif route == "/api/findings":
             findings = self.ctx.store.events(
-                limit=int(params.get("limit", 200)),
+                limit=self._int_param(params.get("limit"), 200, 1, 2000),
                 severity=params.get("severity"),
                 event_type=params.get("type"),
                 status=params.get("status"),
@@ -162,6 +274,49 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif route == "/api/rules":
             self._json(self.ctx.engine.info())
+        elif route == "/api/graph":
+            self._json(graph.build(
+                self.ctx.store.events(limit=self._int_param(params.get("limit"), 800, 1, 5000),
+                                      event_type="yara_match"),
+                max_nodes=getattr(self.ctx.cfg, "graph_max_nodes", 600),
+                linking_only=params.get("linking") == "1"))
+        elif route == "/api/cases":
+            if self.ctx.cases is None:
+                self._json({"error": "cases not enabled"}, 503)
+                return
+            self._json({"cases": self.ctx.cases.all(params.get("status", "")),
+                        "summary": self.ctx.cases.summary()})
+        elif route == "/api/cases/detail":
+            if self.ctx.cases is None:
+                self._json({"error": "cases not enabled"}, 503)
+                return
+            case = self.ctx.cases.get((params.get("id") or "").strip())
+            if case is None:
+                self._json({"error": "unknown case"}, 404)
+                return
+            self._json({"case": case, "findings": self._case_findings(case)})
+        elif route == "/api/report":
+            self._report(params)
+        elif route == "/api/hunt":
+            self._json(hunt.run(
+                params.get("q", ""),
+                self.ctx.store.events(limit=5000, event_type=params.get("type") or "all"),
+                limit=self._int_param(params.get("limit"), 300, 1, 2000)))
+        elif route == "/api/hunt/saved":
+            self._json({"hunts": self._saved_hunts()})
+        elif route == "/api/attack/coverage":
+            # Rule index says what the ruleset *can* see; findings say what it
+            # *has* seen. The gap between them is the point of the view.
+            self._json(attack.coverage(
+                self.ctx.engine.info().get("rules", []),
+                self.ctx.store.events(
+                    limit=self._int_param(params.get("limit"), 2000, 1, 5000),
+                    event_type="yara_match")))
+        elif route == "/api/attack/techniques":
+            self._json({
+                "tactics": [{"id": t, "name": n} for t, n in attack.TACTICS],
+                "techniques": [attack.describe(t) for t in sorted(attack.TECHNIQUES)],
+            })
         elif route == "/api/telemetry":
             self._json(self.ctx.telemetry.recent(force=params.get("force") == "1"))
         elif route == "/api/intel":
@@ -177,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
                 data["indicators"] = [
                     i for i in data["indicators"]
                     if i["type"] != "ipv4" or i.get("scope") == "external"]
-            limit = int(params.get("limit", 300))
+            limit = self._int_param(params.get("limit"), 300, 1, 2000)
             data["shown"] = min(limit, len(data["indicators"]))
             data["indicators"] = data["indicators"][:limit]
             data["source_findings"] = len(events)
@@ -200,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
             if not finding_id:
                 self._json({"error": "id is required"}, 400)
                 return
-            finding = self.ctx.remediator._find(finding_id) if self.ctx.remediator else None
+            finding = self.ctx.store.find(finding_id)
             if finding is None:
                 self._json({"error": "unknown finding"}, 404)
                 return
@@ -252,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "nvd adapter not enabled"}, 503)
                 return
             self._json({"cves": self.ctx.nvd.cached_records(
-                limit=int(params.get("limit", 100)),
+                limit=self._int_param(params.get("limit"), 100, 1, 1000),
                 severity=params.get("severity", ""))})
         elif route == "/api/nvd/cve":
             if self.ctx.nvd is None:
@@ -271,15 +426,21 @@ class Handler(BaseHTTPRequestHandler):
             if not query:
                 self._json({"error": "q is required"}, 400)
                 return
-            self._json(self.ctx.nvd.search(query, int(params.get("limit", 20))))
+            self._json(self.ctx.nvd.search(
+                query, self._int_param(params.get("limit"), 20, 1, 200)))
         elif route == "/api/stream":
             self._stream()
         else:
             self._json({"error": "not found"}, 404)
 
-    do_HEAD = do_GET
-
-    def do_POST(self):
+    def _handle_post(self):
+        # Read the body before anything can reject the request. This is a
+        # keep-alive correctness rail, not a convenience: protocol_version is
+        # HTTP/1.1, so an unread request body stays in the socket buffer and
+        # the server parses it as the next request line, resetting the
+        # connection instead of delivering the 403 it just wrote. Reading is
+        # not acting on it - every rail below still applies.
+        raw = self._read_body_bytes()
         if not self._host_allowed():
             self._json({"error": "host not allowed"}, 403)
             return
@@ -288,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
         if not allowed:
             self._json({"error": why}, 403)
             return
-        body = self._body()
+        body = self._parse_body(raw)
 
         if route == "/api/scan":
             target = str(body.get("path", "")).strip()
@@ -335,7 +496,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.ctx.nvd is None:
                 self._json({"error": "nvd adapter not enabled"}, 503)
                 return
-            days = int(body.get("days") or getattr(self.ctx.cfg, "nvd_sync_days", 3))
+            days = self._int_param(body.get("days"),
+                                   getattr(self.ctx.cfg, "nvd_sync_days", 3), 1, 120)
             result = self.ctx.nvd.sync(days, getattr(self.ctx.cfg, "nvd_max_records", 4000))
             self.ctx.store.broadcast({
                 "event_type": "monitor", "timestamp": now_iso(),
@@ -378,9 +540,20 @@ class Handler(BaseHTTPRequestHandler):
                 action=str(body.get("action", "quarantine")),
                 confirm=bool(body.get("confirm")),
                 dry_run=body.get("dry_run", True) is not False,
-                limit=int(body.get("limit", 50)),
+                limit=self._int_param(body.get("limit"), 50, 1, 500),
             )
             self._json(result)
+        elif route.startswith("/api/cases"):
+            if self.ctx.cases is None:
+                self._json({"error": "cases not enabled"}, 503)
+                return
+            self._cases_post(route, body)
+        elif route == "/api/hunt/saved":
+            name = str(body.get("name", "")).strip()[:60]
+            if not name:
+                self._json({"error": "name is required"}, 400)
+                return
+            self._json({"hunts": self._save_hunt(name, str(body.get("query", "")).strip())})
         elif route == "/api/triage":
             updated = self.ctx.store.set_status(
                 str(body.get("id", "")),
@@ -394,6 +567,123 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    # ----------------------------------------------------------------- cases
+    def _case_findings(self, case: dict) -> list:
+        """Resolve a case's finding ids to the findings themselves.
+
+        Cases store ids, never copies, so a case can never drift out of date
+        with the evidence it points at.
+        """
+        out = []
+        for finding_id in case.get("finding_ids") or []:
+            found = self.ctx.store.find(str(finding_id))
+            if found is not None:
+                out.append(found)
+        if self.ctx.remediator is not None and out:
+            out = self.ctx.remediator.annotate_many(out)
+        return out
+
+    def _cases_post(self, route: str, body: dict) -> None:
+        cases = self.ctx.cases
+        case_id = str(body.get("id", "")).strip()
+        if route == "/api/cases":
+            try:
+                case = cases.create(
+                    title=str(body.get("title", "")),
+                    owner=str(body.get("owner", "")),
+                    severity=str(body.get("severity", "medium")),
+                    finding_ids=body.get("finding_ids") or [],
+                    summary=str(body.get("summary", "")))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 400)
+                return
+            self._json({"case": case}, 201)
+            return
+        if not case_id:
+            self._json({"error": "id is required"}, 400)
+            return
+        if route == "/api/cases/update":
+            result = cases.update(case_id, **body)
+        elif route == "/api/cases/link":
+            result = cases.link(case_id, body.get("finding_ids") or [],
+                                detach=bool(body.get("detach")))
+        elif route == "/api/cases/note":
+            result = cases.add_note(case_id, str(body.get("text", "")),
+                                    str(body.get("author", "")))
+            if result is None and str(body.get("text", "")).strip():
+                self._json({"error": "unknown case"}, 404)
+                return
+            if result is None:
+                self._json({"error": "note text is required"}, 400)
+                return
+        elif route == "/api/cases/delete":
+            # Deleting a case never touches the findings it referenced; the
+            # evidence and the audit trail outlive the container.
+            if not body.get("confirm"):
+                self._json({"error": "confirmation required",
+                            "detail": "resend with confirm=true"}, 409)
+                return
+            self._json({"deleted": cases.delete(case_id)})
+            return
+        else:
+            self._json({"error": "not found"}, 404)
+            return
+        if result is None:
+            self._json({"error": "unknown case"}, 404)
+            return
+        self._json({"case": result})
+
+    def _report(self, params: dict) -> None:
+        if self.ctx.cases is None:
+            self._json({"error": "cases not enabled"}, 503)
+            return
+        case = self.ctx.cases.get((params.get("case") or "").strip())
+        if case is None:
+            self._json({"error": "unknown case"}, 404)
+            return
+        findings = self._case_findings(case)
+        indicators = summarise(findings).get("indicators", [])
+        campaigns = graph.build(findings, linking_only=True).get("campaigns", [])
+        ledger = []
+        if self.ctx.remediator is not None:
+            status = self.ctx.remediator.status()
+            paths = {f.get("file_path") for f in findings}
+            ledger = [r for r in (status.get("recent") or [])
+                      if r.get("file_path") in paths]
+        html = report.render(case, findings, indicators, campaigns, ledger,
+                             now_iso(), _suite_version())
+        body = html.encode("utf-8")
+        disposition = 'attachment; filename="case-%s.html"' % case["id"]             if params.get("download") == "1" else "inline"
+        self._send(200, body, "text/html; charset=utf-8",
+                   {"Content-Disposition": disposition})
+
+    # ----------------------------------------------------------- saved hunts
+    def _hunts_path(self) -> Path:
+        return Path(getattr(self.ctx.cfg, "hunts_file",
+                            str(Path(self.ctx.cfg.findings_log).parent / "hunts.json")))
+
+    def _saved_hunts(self) -> list:
+        path = self._hunts_path()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return data if isinstance(data, list) else []
+
+    def _save_hunt(self, name: str, query: str) -> list:
+        hunts = [h for h in self._saved_hunts() if h.get("name") != name]
+        if query:                                  # empty query deletes
+            hunts.append({"name": name, "query": query, "saved_at": now_iso()})
+        path = self._hunts_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(hunts, indent=2), encoding="utf-8")
+        except OSError as exc:
+            print("[-] Could not persist saved hunts: " + str(exc))
+        return hunts
+
     # ---------------------------------------------------------------- state
     def _state(self) -> dict:
         cfg = self.ctx.cfg
@@ -401,6 +691,9 @@ class Handler(BaseHTTPRequestHandler):
             "stats": self.ctx.store.stats(),
             "monitor": self.ctx.monitor.status(),
             "engine": self.ctx.engine.info(),
+            "stream": {
+                "dropped_subscribers": getattr(self.ctx.store, "dropped_subscribers", 0),
+            },
             "telemetry": self.ctx.telemetry.recent(),
             "config": {
                 "watch_paths": cfg.watch_paths,
@@ -417,22 +710,38 @@ class Handler(BaseHTTPRequestHandler):
             return {"source": "nvd", "status": "disabled"}
         return self.ctx.nvd.status()
 
+    def _vt_key_status(self, vt_key: str) -> str:
+        """Reachability of the configured VirusTotal key, cached.
+
+        This is a blocking outbound request. Uncached, every /api/intel GET
+        parked a server thread on it for up to two seconds, and the dashboard
+        polls that endpoint.
+        """
+        now = time.time()
+        with _VT_STATUS_LOCK:
+            cached = _VT_STATUS_CACHE.get(vt_key)
+            if cached and now - cached[0] < VT_STATUS_TTL:
+                return cached[1]
+        request = urllib.request.Request(
+            "https://www.virustotal.com/api/v3/users/me",
+            headers={"x-apikey": vt_key, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                status = "online" if response.status == 200 else "configured"
+        except urllib.error.HTTPError as exc:
+            status = ("rejected" if exc.code in (401, 403)
+                      else "rate limited" if exc.code == 429 else "configured")
+        except (urllib.error.URLError, TimeoutError, OSError):
+            status = "offline"
+        with _VT_STATUS_LOCK:
+            _VT_STATUS_CACHE[vt_key] = (now, status)
+        return status
+
     def _intel(self) -> dict:
         """Return source adapters without ever returning credentials to clients."""
         vt_key = str(getattr(self.ctx.cfg, "virustotal_api_key", "") or "").strip()
-        vt_status = "optional"
-        if vt_key:
-            request = urllib.request.Request(
-                "https://www.virustotal.com/api/v3/users/me",
-                headers={"x-apikey": vt_key, "Accept": "application/json"},
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=2) as response:
-                    vt_status = "online" if response.status == 200 else "configured"
-            except urllib.error.HTTPError as exc:
-                vt_status = "rejected" if exc.code in (401, 403) else "rate limited" if exc.code == 429 else "configured"
-            except (urllib.error.URLError, TimeoutError, OSError):
-                vt_status = "offline"
+        vt_status = self._vt_key_status(vt_key) if vt_key else "optional"
         nvd_state = self._nvd_status()
         nvd_cached = int(nvd_state.get("cached") or 0)
         nvd_status = "offline" if nvd_state.get("last_error") else (
@@ -479,6 +788,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ SSE
     def _stream(self):
+        if self.command == "HEAD":
+            # do_HEAD shares this router; without this a HEAD /api/stream would
+            # enter the loop below and hold a thread open forever.
+            self._send(200, b"", "text/event-stream")
+            return
         sub = self.ctx.store.subscribe()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -492,6 +806,13 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 try:
                     event = sub.get(timeout=1.0)
+                    if event.get("__stream__") == "overflow":
+                        # We fell too far behind and the store detached us.
+                        # Close so EventSource reconnects onto a fresh
+                        # subscription; staying open would mean showing a
+                        # "live" dashboard that receives nothing.
+                        self._sse("overflow", {"reason": "client fell behind"})
+                        break
                     self._sse("event", event)
                 except queue.Empty:
                     pass
@@ -521,11 +842,16 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 def serve(cfg, engine, store, telemetry, monitor, nvd=None, osv=None,
-          vt=None, remediator=None, guidance=None) -> DashboardServer:
+          vt=None, remediator=None, guidance=None, cases=None) -> DashboardServer:
     httpd = DashboardServer((cfg.host, cfg.port), Handler)
     httpd.ctx = Context(cfg, engine, store, telemetry, monitor, nvd, osv, vt,
-                        remediator, guidance)  # type: ignore[attr-defined]
+                        remediator, guidance, cases)  # type: ignore[attr-defined]
     thread = threading.Thread(target=httpd.serve_forever, name="securitysuite-http",
                               daemon=True)
     thread.start()
     return httpd
+
+
+def _suite_version() -> str:
+    from . import __version__
+    return __version__
