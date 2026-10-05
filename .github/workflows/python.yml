@@ -13,11 +13,12 @@ permissions:
 jobs:
   validate:
     name: Validate on Python ${{ matrix.python-version }}
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
       - name: Check out repository
@@ -37,11 +38,21 @@ jobs:
 
       - name: Compile Python package
         shell: pwsh
-        run: python -m compileall securitysuite tools
+        run: python -m compileall securitysuite tools tests
 
       - name: Validate dashboard JavaScript
         shell: pwsh
-        run: node --check web/app.js
+        run: |
+          node --check web/app.js
+          node --check web/console.js
+
+      - name: Run boundary and workflow tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Run smoke tests
+        shell: pwsh
+        run: python tests/smoke.py
 
       - name: Generate database summary
         shell: pwsh
