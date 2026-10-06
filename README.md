@@ -11,7 +11,7 @@
 > installer are still present alongside the current suite. The suite is now a
 > .NET application: build it with `dotnet build` and run `securitysuite`.
 >
-> _Last synced from b071d26 on 2026-10-06._
+> _Last synced from ed4ca2e on 2026-10-06._
 
 
 > **Canonical repository.** This is where the work happens. A read-only mirror
