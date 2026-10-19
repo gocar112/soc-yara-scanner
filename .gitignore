@@ -34,3 +34,9 @@ obj/
 *.user
 __pycache__/
 *.pyc
+
+# Published build the desktop and startup shortcuts point at.
+dist/
+
+# Browser QA dependencies
+node_modules/

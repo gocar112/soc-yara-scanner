@@ -239,11 +239,14 @@ function renderBreakdown(sev, total) {
   }).join("");
 }
 
+/* Rows are [{rule, count}]. They used to be positional [name, count] pairs,
+ * which is what Python's Counter.most_common produced; the named form is the
+ * API's shape now and reading it positionally silently threw. */
 function renderTopRules(rows) {
   const el = $("top-rules");
-  if (!rows.length) { el.innerHTML = '<span class="faint">No hits yet.</span>'; return; }
-  const max = rows[0][1] || 1;
-  el.innerHTML = rows.map(([name, count]) =>
+  if (!rows || !rows.length) { el.innerHTML = '<span class="faint">No hits yet.</span>'; return; }
+  const max = rows[0].count || 1;
+  el.innerHTML = rows.map(({ rule: name, count }) =>
     '<div class="row"><span class="name">' + esc(name) + '</span>' +
     '<span class="meta">' + count + ' hit' + (count === 1 ? "" : "s") + '</span></div>' +
     '<div class="track" style="height:4px;background:var(--panel-2);border-radius:3px;overflow:hidden">' +
@@ -912,6 +915,7 @@ async function refresh() {
     loadRemediation();
     loadShield();
     $("sub-title").textContent = data.config.watch_paths.length + " path(s) monitored";
+    $("version-pill").textContent = "v" + (data.version || "unknown");
   } catch (err) {
     toast("Backend unreachable: " + err.message, true);
   }
@@ -993,8 +997,16 @@ function wire() {
     }
     try {
       const result = await post("/api/findings/clear", { confirm: true });
+      /* The server answers a refused clear with 503, which lands in the catch
+       * below. This guards an older server that answered 200 with
+       * cleared=false: claiming success there would be worse than useless. */
+      if (result.cleared === false) {
+        toast("Clear refused: " + (result.error || "nothing was cleared"), true);
+        return;
+      }
       clearLocalLines();
       toast("Cleared " + result.events + " line(s)" +
+        (result.audit_retained ? ", kept " + result.audit_retained + " remediation record(s)" : "") +
         (result.backup_dir ? " / backup saved" : ""));
       refresh();
       loadFindings();

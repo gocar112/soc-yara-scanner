@@ -70,6 +70,10 @@ internal static class Program
             Console.WriteLine("securitysuite " + RouteTableVersion);
             return 0;
         }
+        // Not disposed: Main still reports a failure after Run returns, and that
+        // report belongs in the log too. AutoFlush means nothing is lost at exit.
+        if (args.LogFile is { } logFile) RedirectToLog(logFile);
+
         if (args.InstallShortcut || args.RemoveShortcut) return Shortcut(args);
 
         var cfg = BuildConfig(args);
@@ -110,6 +114,21 @@ internal static class Program
                 if (!args.NoBrowser) OpenBrowser(existing);
                 return 0;
             }
+        }
+
+        // One monitor per workspace. The probe above only finds an instance on
+        // a port we guessed; this catches one on any port, which is how the
+        // same file ended up detected twice with an identical hash.
+        using var workspace = WorkspaceLock.Acquire(cfg.FindingsLog);
+        if (!workspace.Held)
+        {
+            Status("[-] Another Security Suite is already monitoring this workspace.");
+            Status("    Findings log : " + cfg.FindingsLog);
+            if (workspace.HeldBy is { } owner) Status("    Held by      : " + owner);
+            Status("    Two monitors on one workspace scan every file twice and write");
+            Status("    duplicate findings, so this one will not start. Stop the other,");
+            Status("    or point this one at a different workspace with its own config.");
+            return 1;
         }
 
         monitor.Start();
@@ -184,7 +203,39 @@ internal static class Program
         return 0;
     }
 
-    private static string RouteTableVersion => "2.0.0";
+    private static string RouteTableVersion => SuiteVersion.Current;
+
+    /// <summary>Past this size the log is rolled to <c>.1</c> at the next start.</summary>
+    private const long LogRollBytes = 5 * 1024 * 1024;
+
+    /// <summary>
+    /// Send stdout and stderr to a file, for a suite running without a window.
+    /// </summary>
+    /// <remarks>
+    /// The windowless launcher passes this, because otherwise every status line
+    /// - including why the suite refused to start - would go to a console no one
+    /// can see. The file is shared for reading so it can be followed while the
+    /// suite runs.
+    /// </remarks>
+    private static void RedirectToLog(string path)
+    {
+        var full = SuitePaths.Resolve(path);
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+
+        var info = new FileInfo(full);
+        if (info.Exists && info.Length > LogRollBytes)
+            File.Move(full, full + ".1", overwrite: true);
+
+        var stream = new FileStream(full, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        var writer = TextWriter.Synchronized(new StreamWriter(stream) { AutoFlush = true });
+
+        writer.WriteLine();
+        writer.WriteLine("==== " + DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz") +
+                         " securitysuite " + SuiteVersion.Current +
+                         " (pid " + Environment.ProcessId + ")");
+        Console.SetOut(writer);
+        Console.SetError(writer);
+    }
 
     /// <summary>Create or remove the desktop or startup shortcut, then exit.</summary>
     private static int Shortcut(CliOptions args)
@@ -209,7 +260,11 @@ internal static class Program
 
             var target = Platform.DesktopLauncher.Install(args.Startup);
             Status("[*] Created   : " + target);
-            Status("[*] Runs      : " + Platform.DesktopLauncher.ExecutablePath + " --no-browser");
+            Status("[*] Runs      : " + (Platform.DesktopLauncher.LaunchPath + " " +
+                                       Platform.DesktopLauncher.Arguments(args.Startup)).TrimEnd());
+            if (Platform.DesktopLauncher.LaunchPath == Platform.DesktopLauncher.ExecutablePath)
+                Status("[!] securitysuitew.exe is not beside it, so a console window will open." +
+                       " Publish with: dotnet publish src/SecuritySuite.Cli -c Release -o dist");
             Status("[*] From      : " + SuitePaths.Root);
             Status("[*] Icon      : " + Platform.DesktopLauncher.IconPath);
             return 0;
